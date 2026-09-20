@@ -2,7 +2,8 @@ import Foundation
 
 struct MockChangeProvider: ChangeProvider {
     func loadSnapshot() async throws -> ReviewSnapshot {
-        ReviewSnapshot(repository: "acme / orbital", branch: "agent/reliable-cache", revision: "mock-v1", changes: Self.changes)
+        ReviewSnapshot(repository: "acme / orbital", branch: "agent/reliable-cache", revision: "mock-v1", changes: Self.changes,
+                       title: "Make caching reliable", scope: "demo", grouped: true)
     }
 
     static var changes: [SemanticChange] { [
@@ -76,6 +77,7 @@ struct MockChangeProvider: ChangeProvider {
 }
 
 struct MockAgentClient: AgentClient {
+    var displayName: String { "Mock Agent" }
     func respond(to request: AgentRequest) async throws -> AgentReply {
         try await Task.sleep(for: .milliseconds(700))
         return AgentReply(text: "[Mock response] I received your request about “\(request.change.title)”: \n\n“\(request.message)”\n\nReview context: \(request.change.rationale)\n\nA connected agent would investigate or propose a new revision here. No code was changed. This change remains pending until you decide.")

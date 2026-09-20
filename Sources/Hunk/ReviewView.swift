@@ -14,6 +14,8 @@ struct ReviewView: View {
     @Bindable var store: ReviewStore
     @State private var showAgent = false
     @State private var exportError: String?
+    @State private var confirmDiscard = false
+    @State private var confirmRegroup = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -23,6 +25,7 @@ struct ReviewView: View {
                 sidebar.frame(width: 252)
                 Rectangle().fill(Palette.line).frame(width: 1)
                 VStack(spacing: 0) {
+                    banners
                     if store.isLoading {
                         Spacer(); ProgressView("Loading changes…"); Spacer()
                     } else if let error = store.error {
@@ -37,20 +40,30 @@ struct ReviewView: View {
                         changeHeader(change)
                         ScrollView {
                             VStack(alignment: .leading, spacing: 24) {
-                                rationale(change)
+                                if !change.rationale.isEmpty { rationale(change) }
                                 ForEach(change.patches) { patch in PatchView(patch: patch) }
-                                Label(change.risk, systemImage: "exclamationmark.circle")
-                                    .font(.system(size: 12)).foregroundStyle(Palette.muted)
-                                DisclosureGroup("Suggested verification · not run") {
-                                    Text(change.validation).font(.system(size: 12))
-                                        .foregroundStyle(Palette.muted).frame(maxWidth: .infinity, alignment: .leading).padding(.top, 8)
-                                }.font(.system(size: 12)).tint(Palette.muted)
+                                if !change.risk.isEmpty {
+                                    Label(change.risk, systemImage: "exclamationmark.circle")
+                                        .font(.system(size: 12)).foregroundStyle(Palette.muted).textSelection(.enabled)
+                                }
+                                if !change.validation.isEmpty {
+                                    DisclosureGroup("Suggested verification · not run") {
+                                        Text(change.validation).font(.system(size: 12)).textSelection(.enabled)
+                                            .foregroundStyle(Palette.muted).frame(maxWidth: .infinity, alignment: .leading).padding(.top, 8)
+                                    }.font(.system(size: 12)).tint(Palette.muted)
+                                }
                             }.padding(32).frame(maxWidth: 1100)
                                 .frame(maxWidth: .infinity)
-                        }
+                        }.id(change.id)
                         actions(change)
                     } else {
-                        ContentUnavailableView("No changes to review", systemImage: "checkmark.circle", description: Text("Your review queue is empty."))
+                        ContentUnavailableView {
+                            Label("No changes to review", systemImage: "checkmark.circle")
+                        } description: {
+                            Text(store.isDemo ? "Your review queue is empty." : "Nothing to review in “\(store.scope.label)”. Try another scope or reload after your agent makes changes.")
+                        } actions: {
+                            Button("Reload") { Task { await store.load() } }
+                        }
                     }
                 }.frame(maxWidth: .infinity, maxHeight: .infinity)
             }
@@ -58,6 +71,24 @@ struct ReviewView: View {
         .background(Palette.background)
         .tint(Palette.accent)
         .sheet(isPresented: $showAgent) { AgentSheet(store: store) }
+        .dropDestination(for: URL.self) { urls, _ in
+            guard let url = urls.first else { return false }
+            Task { await store.open(url.hasDirectoryPath ? url : url.deletingLastPathComponent()) }
+            return true
+        }
+        .confirmationDialog("Discard \(store.rejected) rejected \(store.rejected == 1 ? "change" : "changes") from the working tree?", isPresented: $confirmDiscard) {
+            Button("Stage accepted and discard rejected", role: .destructive) {
+                Task { await store.applyDecisions(ApplyOptions(stageAccepted: true, discardRejected: true)) }
+            }
+            Button("Discard rejected only", role: .destructive) {
+                Task { await store.applyDecisions(ApplyOptions(stageAccepted: false, discardRejected: true)) }
+            }
+        } message: {
+            Text("Rejected hunks are reverted in your files. A backup patch is saved inside .git/hunk-backups, and untracked files go to the Trash.")
+        }
+        .confirmationDialog("Regroup with \(store.backend.label)?", isPresented: $confirmRegroup) {
+            Button("Regroup and clear \(store.reviewed) \(store.reviewed == 1 ? "decision" : "decisions")", role: .destructive) { Task { await store.group() } }
+        } message: { Text("Grouping redefines the changes, so existing decisions and conversations are cleared.") }
         .alert("Couldn’t export review", isPresented: Binding(get: { exportError != nil }, set: { if !$0 { exportError = nil } })) {
             Button("OK") { exportError = nil }
         } message: { Text(exportError ?? "") }
@@ -68,21 +99,77 @@ struct ReviewView: View {
             Image(systemName: "square.stack.3d.up.fill").foregroundStyle(Palette.accent).font(.system(size: 20))
             Text("hunk").font(.system(size: 17, weight: .semibold, design: .rounded))
             Rectangle().fill(Palette.line).frame(width: 1, height: 18).padding(.horizontal, 8)
-            Text(store.snapshot?.repository ?? "Review workspace").foregroundStyle(Palette.muted)
+            Menu {
+                Button("Open Repository…") { Self.chooseRepository(store) }
+                Button("Open Demo") { Task { await store.openDemo() } }
+            } label: {
+                Label(store.snapshot?.repository ?? store.repositoryURL?.lastPathComponent ?? "Review workspace", systemImage: "folder")
+            }.menuStyle(.borderlessButton).fixedSize().help(store.repositoryURL?.path ?? "Open a Git repository (⌘O)")
+            if !store.isDemo {
+                Picker("Scope", selection: Binding(get: { store.scope }, set: { scope in Task { await store.setScope(scope) } })) {
+                    ForEach(GitScope.allCases) { Text($0.label).tag($0) }
+                }.labelsHidden().pickerStyle(.menu).fixedSize().help("What to review")
+                Button { Task { await store.load() } } label: { Image(systemName: "arrow.clockwise") }
+                    .buttonStyle(.borderless).help("Reload the diff (⌘R)")
+            }
             Spacer()
+            if !store.isDemo {
+                Picker("Agent", selection: Binding(get: { store.backend }, set: { store.setBackend($0) })) {
+                    ForEach(AgentBackend.allCases) { Text($0.label).tag($0) }
+                }.labelsHidden().pickerStyle(.menu).fixedSize().help("Agent CLI used for grouping and questions")
+                Button {
+                    if store.reviewed > 0 || store.snapshot?.grouped == true { confirmRegroup = true } else { Task { await store.group() } }
+                } label: { Label(store.snapshot?.grouped == true ? "Regroup" : "Group changes", systemImage: "sparkles") }
+                    .disabled(!store.canGroup).help("Ask \(store.backend.label) to group hunks into semantic changes (⌘G)")
+                    .keyboardShortcut("g", modifiers: [.command])
+            }
             Label(store.snapshot?.branch ?? "—", systemImage: "arrow.triangle.branch").foregroundStyle(Palette.muted)
-            Text("MOCK SESSION").font(.system(size: 9, weight: .bold, design: .monospaced))
+            Text(store.isDemo ? "MOCK SESSION" : store.snapshot?.grouped == true ? "GROUPED" : "RAW HUNKS")
+                .font(.system(size: 9, weight: .bold, design: .monospaced))
                 .tracking(1).padding(.horizontal, 9).padding(.vertical, 6)
                 .background(Palette.accent.opacity(0.10), in: Capsule()).foregroundStyle(Palette.accent)
         }.font(.system(size: 12)).padding(.horizontal, 24).padding(.top, 30).padding(.bottom, 18)
+            .disabled(store.isBusy || store.isLoading)
+    }
+
+    static func chooseRepository(_ store: ReviewStore) {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true; panel.canChooseFiles = false
+        panel.message = "Choose a Git repository to review"
+        panel.prompt = "Review"
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        Task { await store.open(url) }
+    }
+
+    @ViewBuilder private var banners: some View {
+        if let activity = store.activity {
+            HStack(spacing: 10) {
+                ProgressView().controlSize(.small)
+                Text(activity)
+                Spacer()
+            }.font(.system(size: 12)).padding(.horizontal, 24).padding(.vertical, 10).background(Palette.accent.opacity(0.08))
+        }
+        if let notice = store.notice {
+            HStack(alignment: .top, spacing: 10) {
+                Image(systemName: "info.circle").foregroundStyle(Palette.accent)
+                Text(notice).textSelection(.enabled).lineLimit(8)
+                Spacer()
+                Button { store.notice = nil } label: { Image(systemName: "xmark") }.buttonStyle(.borderless)
+            }.font(.system(size: 12)).padding(.horizontal, 24).padding(.vertical, 10).background(Color.white.opacity(0.04))
+        }
+        ForEach(store.snapshot?.warnings ?? [], id: \.self) { warning in
+            Label(warning, systemImage: "exclamationmark.triangle").font(.system(size: 11)).foregroundStyle(.yellow.opacity(0.85))
+                .frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal, 24).padding(.vertical, 8)
+        }
     }
 
     private var sidebar: some View {
         VStack(alignment: .leading, spacing: 0) {
             Text("REVIEW QUEUE").font(.system(size: 10, weight: .semibold)).tracking(1.8).foregroundStyle(Palette.muted)
                 .padding(.top, 28).padding(.bottom, 16)
-            Text("Make caching reliable").font(.system(size: 18, weight: .semibold)).padding(.bottom, 8)
-            Text("One intention at a time.").font(.system(size: 12)).foregroundStyle(Palette.muted)
+            Text(store.snapshot?.title ?? "Review").font(.system(size: 18, weight: .semibold)).padding(.bottom, 8)
+            Text(store.isDemo || store.snapshot?.grouped == true ? "One intention at a time." : "One hunk at a time · group them to review by intention.")
+                .font(.system(size: 12)).foregroundStyle(Palette.muted)
             HStack {
                 Text("\(store.reviewed) of \(store.changes.count) reviewed")
                 Spacer(); Text("\(Int(store.progress * 100))%")
@@ -101,7 +188,7 @@ struct ReviewView: View {
                                 }.foregroundStyle(statusColor(change))
                                 VStack(alignment: .leading, spacing: 7) {
                                     Text(change.title).font(.system(size: 12, weight: .medium)).multilineTextAlignment(.leading).lineSpacing(3)
-                                    Text("\(change.patches.count) \(change.patches.count == 1 ? "file" : "files") · \(change.decision.rawValue)")
+                                    Text("\(change.fileCount) \(change.fileCount == 1 ? "file" : "files") · +\(change.added) −\(change.removed) · \(change.decision.rawValue)")
                                         .font(.system(size: 10)).foregroundStyle(Palette.muted)
                                 }
                                 Spacer(minLength: 0)
@@ -119,7 +206,8 @@ struct ReviewView: View {
             Divider().overlay(Palette.line)
             HStack(spacing: 7) {
                 Circle().fill(Palette.accent).frame(width: 5, height: 5)
-                Text("Local demo · no agent connected").font(.system(size: 10)).foregroundStyle(Palette.muted)
+                Text(store.isDemo ? "Local demo · no agent connected" : "\(store.backend.label) · read-only access")
+                    .font(.system(size: 10)).foregroundStyle(Palette.muted)
             }.padding(.vertical, 20)
         }.padding(.horizontal, 18).background(Palette.panel.opacity(0.45))
     }
@@ -135,14 +223,16 @@ struct ReviewView: View {
                     .font(.system(size: 10, weight: .medium, design: .monospaced)).tracking(1.8).foregroundStyle(Palette.accent)
                 Spacer()
                 Button { store.move(-1) } label: { Image(systemName: "chevron.left") }
-                    .disabled(store.selectedIndex == 0).help("Previous change")
+                    .disabled(store.selectedIndex == 0).help("Previous change (⌘↑)")
+                    .keyboardShortcut(.upArrow, modifiers: [.command])
                 Button { store.move(1) } label: { Image(systemName: "chevron.right") }
-                    .disabled(store.selectedIndex == store.changes.count - 1).help("Next change")
+                    .disabled(store.selectedIndex == store.changes.count - 1).help("Next change (⌘↓)")
+                    .keyboardShortcut(.downArrow, modifiers: [.command])
             }.buttonStyle(.borderless)
-            Text(change.title).font(.system(size: 29, weight: .semibold)).tracking(-0.7)
+            Text(change.title).font(.system(size: 29, weight: .semibold)).tracking(-0.7).textSelection(.enabled)
             Text(change.summary).font(.system(size: 13)).foregroundStyle(Palette.muted).lineSpacing(4)
             HStack(spacing: 14) {
-                Label("\(change.patches.count) \(change.patches.count == 1 ? "file" : "files")", systemImage: "doc")
+                Label("\(change.fileCount) \(change.fileCount == 1 ? "file" : "files")", systemImage: "doc")
                 Text("+\(change.added)").foregroundStyle(Palette.accent)
                 Text("−\(change.removed)").foregroundStyle(.red.opacity(0.8))
                 Text("·").foregroundStyle(Palette.muted)
@@ -167,17 +257,17 @@ struct ReviewView: View {
     private func actions(_ change: SemanticChange) -> some View {
         HStack(spacing: 12) {
             Button { store.undo() } label: { Image(systemName: "arrow.uturn.backward") }
-                .disabled(store.history.isEmpty || store.busyChangeID != nil)
+                .disabled(store.history.isEmpty || store.isBusy)
                 .keyboardShortcut("z", modifiers: [.command]).help("Undo last decision (⌘Z)")
-            Text("Decisions only · files stay untouched").font(.system(size: 10)).foregroundStyle(Palette.muted)
+            Text(store.canApply ? "Decisions only · apply them from the summary" : "Decisions only · files stay untouched").font(.system(size: 10)).foregroundStyle(Palette.muted)
             Spacer(minLength: 8)
             Button { showAgent = true } label: { Label("Ask Agent", systemImage: "sparkle") }
                 .keyboardShortcut("k", modifiers: [.command])
             Button { store.decide(.rejected) } label: { Label("Reject", systemImage: "xmark") }
-                .keyboardShortcut(.delete, modifiers: [.command]).disabled(change.decision == .rejected || store.busyChangeID != nil)
+                .keyboardShortcut(.delete, modifiers: [.command]).disabled(change.decision == .rejected || store.isBusy)
             Button { store.decide(.accepted) } label: { Label("Accept", systemImage: "checkmark") }
                 .buttonStyle(.borderedProminent).tint(Palette.accent).foregroundStyle(Palette.background)
-                .keyboardShortcut(.return, modifiers: [.command]).disabled(change.decision == .accepted || store.busyChangeID != nil)
+                .keyboardShortcut(.return, modifiers: [.command]).disabled(change.decision == .accepted || store.isBusy)
         }.buttonStyle(.bordered).controlSize(.large).padding(22)
             .background(Palette.panel.opacity(0.5))
             .overlay(alignment: .top) { Rectangle().fill(Palette.line).frame(height: 1) }
@@ -192,13 +282,23 @@ struct ReviewView: View {
                 .font(.system(size: 30, weight: .semibold))
             Text("\(store.accepted) accepted    ·    \(store.rejected) rejected    ·    \(store.changes.count - store.reviewed) pending")
                 .font(.system(size: 13, design: .monospaced)).foregroundStyle(Palette.muted)
-            Text("Export your decisions or revisit any change.\nThis demo does not modify files, run tests, or create commits.")
+            Text(store.canApply
+                 ? "Stage what you accepted, then commit it yourself.\nNothing is staged, reverted, or committed until you choose to."
+                 : store.isDemo ? "Export your decisions or revisit any change.\nThis demo does not modify files, run tests, or create commits."
+                 : "Export your decisions or revisit any change.\nDecisions can be applied when reviewing the working tree.")
                 .font(.system(size: 13)).foregroundStyle(Palette.muted).multilineTextAlignment(.center).lineSpacing(6)
             HStack(spacing: 12) {
                 Button("Undo last decision") { store.undo() }.disabled(store.history.isEmpty)
-                Button("Export review…") { exportReport() }.buttonStyle(.borderedProminent)
-            }.controlSize(.large).padding(.top, 8)
-            Button("Start a fresh demo") { Task { await store.load() } }
+                if store.canApply {
+                    Button("Discard \(store.rejected) rejected…", role: .destructive) { confirmDiscard = true }.disabled(store.rejected == 0)
+                    Button("Export review…") { exportReport() }
+                    Button("Stage \(store.accepted) accepted") { Task { await store.applyDecisions(ApplyOptions()) } }
+                        .buttonStyle(.borderedProminent).disabled(store.accepted == 0)
+                } else {
+                    Button("Export review…") { exportReport() }.buttonStyle(.borderedProminent)
+                }
+            }.controlSize(.large).padding(.top, 8).disabled(store.isBusy)
+            Button(store.isDemo ? "Start a fresh demo" : "Reload diff") { Task { await store.load() } }
                 .buttonStyle(.plain).font(.system(size: 12)).foregroundStyle(Palette.muted).padding(.top, 12)
             Spacer()
         }.frame(maxWidth: .infinity).padding(32)
@@ -216,19 +316,29 @@ struct ReviewView: View {
 
 private struct PatchView: View {
     let patch: FilePatch
+    @State private var showAll = false
+    private static let lineLimit = 400
+    private var visibleLines: ArraySlice<DiffLine> { showAll ? patch.lines[...] : patch.lines.prefix(Self.lineLimit) }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             HStack(spacing: 9) {
                 Image(systemName: "doc.text").foregroundStyle(Palette.muted)
                 Text(patch.path).font(.system(size: 11, weight: .medium, design: .monospaced)).textSelection(.enabled)
                 Spacer()
-                Text("SWIFT").font(.system(size: 8, weight: .medium)).tracking(1).foregroundStyle(Palette.muted)
+                Text("+\(patch.added) −\(patch.removed)").font(.system(size: 10, design: .monospaced)).foregroundStyle(Palette.muted)
+                Text(patch.language).font(.system(size: 8, weight: .medium)).tracking(1).foregroundStyle(Palette.muted)
             }.padding(15).background(Color.white.opacity(0.025))
             Text(patch.symbol).font(.system(size: 10, design: .monospaced)).foregroundStyle(Palette.muted)
                 .padding(.horizontal, 15).padding(.vertical, 11)
+            if let note = patch.note {
+                Label(note, systemImage: "info.circle").font(.system(size: 11)).foregroundStyle(Palette.muted)
+                    .padding(.horizontal, 15).padding(.bottom, 12)
+            }
+            if !patch.lines.isEmpty {
             ScrollView(.horizontal) {
                 VStack(alignment: .leading, spacing: 0) {
-                    ForEach(patch.lines) { line in
+                    ForEach(visibleLines) { line in
                         HStack(spacing: 0) {
                             Text(line.oldNumber.map(String.init) ?? "").frame(width: 36, alignment: .trailing)
                             Text(line.newNumber.map(String.init) ?? "").frame(width: 36, alignment: .trailing).padding(.trailing, 12)
@@ -236,10 +346,15 @@ private struct PatchView: View {
                             Text(line.text.isEmpty ? " " : line.text).foregroundStyle(lineColor(line)).padding(.trailing, 20)
                             Spacer(minLength: 0)
                         }.font(.system(size: 12, design: .monospaced)).foregroundStyle(Palette.muted.opacity(0.65))
-                            .padding(.vertical, 6).frame(minWidth: 640, alignment: .leading)
+                            .padding(.vertical, 3).frame(minWidth: 640, alignment: .leading)
                             .background(line.kind == .addition ? Palette.accent.opacity(0.075) : line.kind == .deletion ? Color.red.opacity(0.075) : .clear)
                     }
                 }.fixedSize(horizontal: true, vertical: false).textSelection(.enabled).padding(.bottom, 12)
+            }
+            }
+            if !showAll, patch.lines.count > Self.lineLimit {
+                Button("Show all \(patch.lines.count) lines") { showAll = true }
+                    .buttonStyle(.borderless).font(.system(size: 11)).padding(.horizontal, 15).padding(.bottom, 12)
             }
         }.background(Palette.panel.opacity(0.55), in: RoundedRectangle(cornerRadius: 10))
             .clipShape(RoundedRectangle(cornerRadius: 10))
@@ -264,14 +379,15 @@ private struct AgentSheet: View {
                 Button("Done") { dismiss() }.keyboardShortcut(.cancelAction)
             }
             Text(store.selected?.title ?? "Change").font(.system(size: 13)).foregroundStyle(Palette.accent)
-            Text("Mock conversation · responses are simulated; no code is edited.")
+            Text(store.isDemo ? "Mock conversation · responses are simulated; no code is edited."
+                 : "\(store.agentName) can read this repository but can’t edit it. Replies may take a minute.")
                 .font(.system(size: 11)).foregroundStyle(Palette.muted)
             ScrollView {
                 VStack(alignment: .leading, spacing: 14) {
                     if let id = store.selectedID {
                         ForEach(store.conversations[id] ?? []) { item in
                             VStack(alignment: .leading, spacing: 7) {
-                                Text(item.isUser ? "YOU" : "MOCK AGENT").font(.system(size: 9, weight: .bold)).tracking(1)
+                                Text(item.isUser ? "YOU" : store.agentName.uppercased()).font(.system(size: 9, weight: .bold)).tracking(1)
                                     .foregroundStyle(item.isUser ? Palette.muted : Palette.accent)
                                 Text(item.text).font(.system(size: 13)).lineSpacing(4).textSelection(.enabled)
                             }.padding(14).frame(maxWidth: .infinity, alignment: .leading)
@@ -280,7 +396,7 @@ private struct AgentSheet: View {
                     }
                     if store.busyChangeID != nil { ProgressView("Thinking…").font(.caption) }
                 }
-            }.frame(minHeight: 180)
+            }.frame(minHeight: 180).defaultScrollAnchor(.bottom)
             HStack {
                 ForEach(["Explain the tradeoffs", "What could go wrong?", "Suggest a simpler approach"], id: \.self) { prompt in
                     Button(prompt) { message = prompt }.font(.system(size: 10))
@@ -296,8 +412,8 @@ private struct AgentSheet: View {
                     let text = message; message = ""
                     Task { await store.ask(text) }
                 }.buttonStyle(.borderedProminent).keyboardShortcut(.return, modifiers: [.command])
-                    .disabled(message.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || store.busyChangeID != nil)
+                    .disabled(message.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || store.isBusy)
             }
-        }.padding(26).frame(width: 610, height: 560).background(Palette.background)
+        }.padding(26).frame(width: 680, height: 620).background(Palette.background)
     }
 }

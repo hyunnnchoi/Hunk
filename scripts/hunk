@@ -1,0 +1,10 @@
+#!/bin/bash
+# Review a repository in Hunk: `scripts/hunk [path]` (defaults to the current directory).
+# Symlink this somewhere on your PATH after running scripts/build-app.sh.
+set -euo pipefail
+SOURCE="$(readlink "$0" || true)"
+APP="$(cd "$(dirname "${SOURCE:-$0}")/.." && pwd)/dist/Hunk.app"
+[ -d "$APP" ] || { echo "Build the app first: bash scripts/build-app.sh" >&2; exit 1; }
+TARGET="$(cd "${1:-.}" && pwd)"
+# A bare path would be treated by AppKit as a document to open, so pass it as a flag.
+open -na "$APP" --args "--repo=$TARGET"

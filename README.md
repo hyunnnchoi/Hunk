@@ -2,89 +2,86 @@
 
 **Review AI-generated code, one meaningful change at a time.**
 
-Hunk is a native macOS SwiftUI demo built around changes instead of files. Each change takes center stage with its intent, rationale, and relevant diffs. **Accept**, **Reject**, or **Ask Agent**, then move on. A single change can span multiple files.
+Hunk is a native macOS SwiftUI app built around changes instead of files. Point it at a Git repository, let **Claude Code** or **Codex** group the raw hunks into semantic changes, then **Accept**, **Reject**, or **Ask Agent** one intention at a time. A single change can span multiple files. When you're done, stage what you accepted.
 
-![Hunk showing a semantic change, its rationale, code diff, and review actions](docs/images/hunk-review.jpg)
+![Hunk reviewing a working tree hunk by hunk](docs/images/hunk-git.jpg)
 
 ## Getting started
 
-Requires **macOS 14+** and **Swift 6+**. No external dependencies or API keys are needed.
-
-Open `Package.swift` in Xcode 16 or later, select **Hunk / My Mac**, and run. Alternatively, run from the project directory:
-
-```sh
-swift run Hunk
-```
-
-To build a standalone app bundle:
+Requires **macOS 14+**, **Swift 6+**, and Git. The agent features use whichever of the `claude` and `codex` CLIs you have installed and signed in; everything else works without them.
 
 ```sh
 bash scripts/build-app.sh
-open dist/Hunk.app
+scripts/hunk ~/path/to/repo      # or: open dist/Hunk.app, then ⌘O or drop a folder on the window
 ```
 
-The script builds for your Mac's architecture and applies an ad-hoc signature for local use. Developer ID signing and notarization for distribution are not included. This is a Swift Package that Xcode opens directly; no `.xcodeproj` is required.
+During development, `swift run Hunk --repo=/path/to/repo` works too, and `--demo` opens the built-in mock session. Hunk reopens the last repository on launch. Pass the path as `--repo=`; AppKit treats a bare path argument as a document and won't open a window.
 
-## Reviewing changes
+The build script applies an ad-hoc signature for local use. Developer ID signing and notarization are not included.
 
-1. Explore four mock changes for a caching improvement.
-2. Read the rationale, additions, deletions, and risk notes in the central review area. Scroll horizontally to inspect long lines.
-3. Choose **Accept** or **Reject** to advance to the next pending change. Navigation wraps around to earlier pending changes when needed.
-4. Open **Ask Agent** to ask a question or request a revision. Replies are simulated, and each change keeps its own conversation. Choose **Done** to return to the review.
-5. Revisit changes from the queue or use **Undo** to reverse the last decision.
-6. Open the summary and choose **Export review…** to save changes and decision history as JSON. The summary is available before the review is complete.
+## Reviewing a repository
+
+1. Pick a scope in the header: **Working tree** (unstaged edits plus untracked files), **Staged**, or **Branch vs base** (merge-base with `origin/HEAD`, `main`, `master`, or `develop`).
+2. Hunk starts with one change per hunk. Choose **Group changes** (⌘G) to have the selected agent merge related hunks into semantic changes with a title, rationale, risk, and suggested verification. Hunk validates the answer: every hunk ends up in exactly one change, and anything the agent forgot stays reviewable on its own.
+3. **Accept** or **Reject** to advance to the next pending change. **Ask Agent** (⌘K) opens a per-change conversation; the agent can read the repository but not edit it.
+4. Open the summary to **Stage accepted**, optionally **Discard rejected…**, or **Export review…** as JSON.
 
 | Shortcut | Action |
 | --- | --- |
+| ⌘ O / ⌘ R | Open a repository / reload the diff |
+| ⌘ G | Group hunks with the selected agent |
 | ⌘ Return | Accept a change, or send a request in the agent dialog |
 | ⌘ Delete | Reject a change |
+| ⌘ ↑ / ⌘ ↓ | Previous / next change |
 | ⌘ K | Open Ask Agent |
 | ⌘ Z | Undo the last review decision |
 | Escape | Close the agent dialog |
 
-**Accept and Reject record review decisions only.** They do not apply or revert files, stage changes, create commits, or run tests. Sessions are held in memory and reset when the app exits. Export any results you want to keep. Starting a fresh demo clears the current decisions. Decisions and session resets are temporarily disabled while an agent request is in flight.
+Decisions, grouping, and conversations are saved per repository and scope under `~/Library/Application Support/Hunk/sessions` and restored as long as the diff is byte-for-byte the same. If the diff changes, you get a fresh review; an approval of an old diff never carries over to new code.
 
-The sample code consists of illustrative excerpts, not a runnable cache library or validated patches. It intentionally leaves questions such as authentication scope and concurrency open for review. Changes 1 and 3 modify the same function sequentially and should not be treated as independently applicable patches.
+## What applying does
+
+**Accept and Reject only record decisions.** Nothing touches the repository until you apply from the summary, and only in the Working tree scope:
+
+- **Stage accepted** runs `git apply --cached` with exactly the accepted hunks (`git add` for untracked, binary, and mode-only files). Your working files are unchanged; commit when you're ready.
+- **Discard rejected…** asks for confirmation, then reverse-applies the rejected hunks to your files. A backup patch is written to `.git/hunk-backups/` first, and untracked files are moved to the Trash rather than deleted.
+- Before applying, Hunk recomputes the diff fingerprint and refuses if anything changed since the review was loaded. Every patch is verified with `git apply --check` before the first write, so a hunk that no longer applies leaves everything untouched.
+
+Hunk never commits, pushes, or runs tests.
+
+## Agents
+
+Both CLIs are driven non-interactively, with flags confined to `AgentCLI.swift`:
+
+| | Claude Code | Codex |
+| --- | --- | --- |
+| Invocation | `claude -p --output-format json` | `codex exec --sandbox read-only --ephemeral` |
+| Grouping | `--tools ""` and `--json-schema` | `--output-schema` |
+| Ask Agent | `--tools Read,Grep,Glob` | read-only sandbox |
+
+Prompts go through stdin, never a shell. Diff content is marked as untrusted data in every prompt, and neither agent is given a way to write to the repository. Hunk looks for the CLIs in the usual install locations (apps launched from Finder don't inherit your shell `PATH`); set `HUNK_CLAUDE_PATH` or `HUNK_CODEX_PATH` to override. Grouping sends your diff to the selected provider under your own account.
 
 ## Architecture
 
 ```text
 Sources/Hunk/
-  HunkApp.swift          App entry point and window configuration
-  Domain.swift          Semantic changes, file patches, diff lines, and protocols
-  MockServices.swift    Mock change provider and delayed agent responses
-  ReviewStore.swift     Selection, decisions, undo, conversations, and export
-  ReviewView.swift      Queue, central diff, action bar, conversation, and summary
-Tests/HunkTests/        XCTest coverage for review state
-scripts/               App packaging and standalone smoke tests
+  HunkApp.swift          App entry point, launch arguments, menu commands
+  Domain.swift           Semantic changes, file patches, diff lines, and protocols
+  ReviewStore.swift      Selection, decisions, undo, grouping, applying, persistence
+  ReviewView.swift       Header, queue, central diff, action bar, conversation, summary
+  ProcessRunner.swift    Async Process wrapper with timeouts and cancellation
+  DiffParser.swift       Byte-exact unified diff parser
+  GitServices.swift      Git change provider, scopes, and the decision applier
+  AgentCLI.swift         Claude Code and Codex adapters for questions and grouping
+  SessionArchive.swift   Per-repository session files
+  MockServices.swift     Demo changes and a simulated agent
+Tests/HunkTests/         XCTest coverage for review state
+scripts/                 App packaging, launcher, smoke tests, live agent check
 ```
 
-The model is `SemanticChange → [FilePatch] → [DiffLine]`, keeping semantic grouping separate from file boundaries. The UI does not depend on Git or a particular agent's output format.
+The model is `SemanticChange → [FilePatch] → [DiffLine]`, keeping semantic grouping separate from file boundaries. A `FilePatch` from Git carries its raw file header and hunk text, so applying never re-serializes a diff. Change identities are hashes of hunk content, which is what lets sessions survive a relaunch.
 
-`ReviewStore` uses `@MainActor @Observable` and receives a `ChangeProvider` and an `AgentClient` through its initializer. Asynchronous replies are attached to the change that originated the request, even if selection changes before the reply arrives.
-
-## Connecting Git diffs
-
-Implement `ChangeProvider.loadSnapshot()` in a `GitChangeProvider` and inject it through `ReviewStore(provider:agent:)`. Git execution, diff parsing, and semantic grouping are extension points; they are not implemented in this demo.
-
-Suggested integration steps:
-
-1. Let the user select a repository and comparison scope: working tree, staged changes, or branch.
-2. Invoke Git through Foundation `Process` with an executable URL and an argument array. Do not interpolate user input into shell commands. Read stdout and stderr asynchronously, and handle errors, cancellation, and timeouts.
-3. Parse unified diffs into `FilePatch` and `DiffLine`. Define explicit handling for renames, binary files, deletions, whitespace, and untracked files. Surface unsupported output rather than silently dropping it.
-4. Start with hunk-level groups, then introduce a grouping layer that combines related hunks into a `SemanticChange`. Track hunk identity to avoid duplicate assignments.
-5. Store the base/head identity and a diff content hash in `ReviewSnapshot.revision`. The mock generates new UUIDs on each load; a real provider should derive stable IDs from the revision and hunk identity.
-6. Implement patch application as a separate service. Before applying changes, revalidate the revision, check overlapping and dependent patches, verify applicability, and handle failures atomically. Do not turn a review decision directly into a file deletion or restoration.
-
-## Connecting Codex or Claude Code
-
-Implement `AgentClient.respond(to:)` in a dedicated adapter. `AgentRequest` includes the snapshot revision, the complete semantic change, and the user's message. `AgentReply` currently returns text only.
-
-- Check the installed CLI version's supported structured output and session interface, then encapsulate those details inside the adapter. This project does not assume specific CLI flags or APIs.
-- Manage the executable path, working directory, and authentication in a configuration layer. Handle stderr, exit codes, cancellation, and timeouts.
-- For streaming, extend the response interface to `AsyncThrowingStream<AgentEvent, Error>`.
-- If an agent edits code, load a new snapshot and invalidate or safely remap decisions from the old revision. Approval of an old diff must not silently apply to new code.
-- Treat agent output and repository contents as untrusted data. Instructions embedded in source files must not grant permission to execute commands.
+`ReviewStore` is `@MainActor @Observable` and talks only to protocols: `ChangeProvider`, `AgentClient`, `ChangeGrouper`, `DecisionApplier`, and `SessionArchive`. Asynchronous replies are attached to the change that originated the request, even if selection changes before the reply arrives.
 
 ## Validation
 
@@ -93,7 +90,16 @@ swift build
 bash scripts/smoke-test.sh
 ```
 
-The standalone smoke tests work with Command Line Tools without a full Xcode installation. They cover decision navigation, undo, wraparound, reply isolation during an in-flight agent request, JSON export, session reset, multi-file grouping, and loading failures.
+The standalone smoke tests work with Command Line Tools without a full Xcode installation. They cover review state (navigation, undo, wraparound, in-flight agent isolation, export), diff parsing edge cases (CRLF, header-like content, missing trailing newline, binary files, quoted paths), and a real temporary Git repository: stable identities, session restore, grouping validation, staging and discarding with a backup, refusing a stale review, and scopes.
+
+To check the agent adapters against the real CLIs (this uses your account):
+
+```sh
+bash scripts/agent-live-check.sh claude
+bash scripts/agent-live-check.sh codex
+```
+
+`HUNK_SNAPSHOT=/tmp/hunk.png swift run Hunk --repo=/path/to/repo` saves the window as a PNG and quits, which is handy for visual checks without screen-recording permission.
 
 With a full Xcode installation and XCTest available, also run:
 
@@ -107,4 +113,4 @@ For manual UI verification, resize the window, navigate between changes, inspect
 
 ## Current scope
 
-Hunk currently runs entirely on local mock data. Git operations, real agent execution, a test runner, session persistence and import, syntax highlighting, a code editor, and dependency-aware partial application remain future work. Review state and integration interfaces are separated so these capabilities can be added incrementally.
+Agents answer questions and group hunks; they don't edit code from inside Hunk yet, so a requested revision comes back as a proposed diff in the conversation. Replies are not streamed. Splitting a single hunk, syntax highlighting, committing, running tests, and unstaging from the Staged scope remain future work.
